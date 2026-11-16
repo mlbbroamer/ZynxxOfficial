@@ -13,7 +13,7 @@ android {
         minSdk = 26
         targetSdk = 35
         versionCode = 1
-        versionName = "1.0.0"
+        versionName = "1.0.1"
 
         vectorDrawables {
             useSupportLibrary = true
@@ -47,6 +47,12 @@ android {
         compose = true
         buildConfig = true
     }
+
+    packaging {
+        resources {
+            excludes += setOf("META-INF/INDEX.LIST", "META-INF/DEPENDENCIES")
+        }
+    }
 }
 
 dependencies {
@@ -66,5 +72,6 @@ dependencies {
     implementation("com.google.code.gson:gson:2.11.0")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     implementation("com.google.zxing:core:3.5.3")
+    implementation("com.android.tools.build:apksig:8.6.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

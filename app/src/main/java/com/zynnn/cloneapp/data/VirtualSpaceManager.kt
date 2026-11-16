@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.Drawable
+import android.net.Uri
 import android.provider.Settings
 import androidx.core.content.pm.ShortcutInfoCompat
 import androidx.core.content.pm.ShortcutManagerCompat
@@ -88,7 +89,8 @@ class VirtualSpaceManager(private val context: Context) {
         val result = packages.mapNotNull { pkgInfo ->
             val appInfo = pkgInfo.applicationInfo ?: return@mapNotNull null
             if (pkgInfo.packageName == context.packageName) return@mapNotNull null
-            val launchIntent = pm.getLaunchIntentForPackage(pkgInfo.packageName) ?: return@mapNotNull null
+            if (pkgInfo.packageName.startsWith("zynnn.s")) return@mapNotNull null
+            pm.getLaunchIntentForPackage(pkgInfo.packageName) ?: return@mapNotNull null
             val isSystem = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0
             val label = appInfo.loadLabel(pm).toString()
             val apkFile = File(appInfo.sourceDir)
@@ -107,55 +109,100 @@ class VirtualSpaceManager(private val context: Context) {
         _installedApps.value = result
     }
 
-    suspend fun cloneAppsBatch(apps: List<InstalledAppInfo>, copyApk: Boolean, toSecretZone: Boolean = false): List<ClonedApp> =
-        withContext(Dispatchers.IO) {
+    suspend fun cloneAppsBatch(
+        apps: List<InstalledAppInfo>,
+        copyApk: Boolean,
+        toSecretZone: Boolean = false
+    ): Result<List<ClonedApp>> = withContext(Dispatchers.IO) {
+        runCatching {
             val current = _clonedApps.value.toMutableList()
             val added = mutableListOf<ClonedApp>()
             for (app in apps.take(9)) {
                 val existingSpaces = current.filter { it.packageName == app.packageName }.map { it.spaceId }
                 val nextSpaceId = (1..99).firstOrNull { it !in existingSpaces } ?: (existingSpaces.size + 1)
-                var copiedPath: String? = null
-                if (copyApk && app.apkPath.isNotBlank()) {
-                    val spaceDir = File(context.filesDir, "spaces/space_${nextSpaceId}/${app.packageName}")
-                    spaceDir.mkdirs()
-                    val dest = File(spaceDir, "base.apk")
-                    runCatching {
-                        File(app.apkPath).copyTo(dest, overwrite = true)
-                        copiedPath = dest.absolutePath
-                    }
+                val isolatedPkg = ApkClonerEngine.buildIsolatedPackageName(app.packageName, nextSpaceId)
+                val spaceDir = File(context.filesDir, "spaces/space_${nextSpaceId}/${app.packageName}")
+                val outApk = File(spaceDir, "cloned_signed.apk")
+
+                if (app.apkPath.isNotBlank()) {
+                    ApkClonerEngine.createClonedApk(
+                        context = context,
+                        sourceApkPath = app.apkPath,
+                        originalPackage = app.packageName,
+                        newPackageName = isolatedPkg,
+                        outputApk = outApk
+                    )
                 }
+
                 val clone = ClonedApp(
                     packageName = app.packageName,
+                    clonedPackageName = isolatedPkg,
                     originalName = app.appName,
-                    customName = if (nextSpaceId == 1) app.appName else "${app.appName} ($nextSpaceId)",
+                    customName = "${app.appName} (S$nextSpaceId)",
                     spaceId = nextSpaceId,
                     copyApkMode = copyApk,
-                    copiedApkPath = copiedPath,
+                    copiedApkPath = if (outApk.exists()) outApk.absolutePath else null,
+                    isInstalledClone = isPackageInstalled(isolatedPkg),
                     isSecretZone = toSecretZone,
                     deviceIdentity = originalDeviceIdentity()
                 )
                 current.add(0, clone)
                 added.add(clone)
+
+                if (outApk.exists() && ApkClonerEngine.canRequestPackageInstalls(context)) {
+                    ApkClonerEngine.installClonedApk(context, outApk)
+                }
             }
             persistClones(current)
             added
         }
+    }
 
-    fun launchClonedApp(clone: ClonedApp): Boolean {
-        val updated = _clonedApps.value.map {
-            if (it.id == clone.id) it.copy(isRunning = true) else it
+    fun isPackageInstalled(pkg: String): Boolean {
+        if (pkg.isBlank()) return false
+        return runCatching {
+            context.packageManager.getPackageInfo(pkg, 0)
+            true
+        }.getOrDefault(false)
+    }
+
+    /**
+     * Launches the truly isolated cloned package ([ClonedApp.clonedPackageName]) which has
+     * its own /data/data/<clonedPackageName> directory. If not yet installed, triggers
+     * PackageInstaller (or opens Unknown Sources permission) instead of launching the original app.
+     */
+    fun launchClonedApp(clone: ClonedApp): LaunchStatus {
+        val targetPkg = clone.clonedPackageName.ifBlank {
+            ApkClonerEngine.buildIsolatedPackageName(clone.packageName, clone.spaceId)
         }
-        persistClones(updated)
-        val launchIntent = context.packageManager.getLaunchIntentForPackage(clone.packageName) ?: return false
-        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_MULTIPLE_TASK)
-        context.startActivity(launchIntent)
-        return true
+        val launchIntent = context.packageManager.getLaunchIntentForPackage(targetPkg)
+        if (launchIntent != null) {
+            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_MULTIPLE_TASK)
+            context.startActivity(launchIntent)
+            persistClones(_clonedApps.value.map {
+                if (it.id == clone.id) it.copy(isRunning = true, isInstalledClone = true) else it
+            })
+            return LaunchStatus.LAUNCHED
+        }
+
+        if (!ApkClonerEngine.canRequestPackageInstalls(context)) {
+            ApkClonerEngine.openInstallPermissionSettings(context)
+            return LaunchStatus.NEEDS_INSTALL_PERMISSION
+        }
+
+        val apkFile = clone.copiedApkPath?.let { File(it) }
+        if (apkFile != null && apkFile.exists()) {
+            ApkClonerEngine.installClonedApk(context, apkFile)
+            return LaunchStatus.INSTALLING
+        }
+        return LaunchStatus.APK_MISSING
     }
 
     fun forceStopClone(cloneId: String) {
         val target = _clonedApps.value.find { it.id == cloneId } ?: return
+        val pkg = target.clonedPackageName.ifBlank { target.packageName }
         val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
-        runCatching { am?.killBackgroundProcesses(target.packageName) }
+        runCatching { am?.killBackgroundProcesses(pkg) }
         persistClones(_clonedApps.value.map { if (it.id == cloneId) it.copy(isRunning = false) else it })
     }
 
@@ -171,7 +218,7 @@ class VirtualSpaceManager(private val context: Context) {
         val dataDir = File(context.filesDir, "spaces/space_${clone.spaceId}/${clone.packageName}/data")
         if (dataDir.exists()) dataDir.deleteRecursively()
         persistClones(_clonedApps.value.map {
-            if (it.id == cloneId) it.copy(cacheSizeMb = 0f, storageSizeMb = 0.5f, isRunning = false) else it
+            if (it.id == cloneId) it.copy(cacheSizeMb = 0f, storageSizeMb = 0f, isRunning = false) else it
         })
     }
 
@@ -194,8 +241,17 @@ class VirtualSpaceManager(private val context: Context) {
 
     fun deleteClone(cloneId: String) {
         val target = _clonedApps.value.find { it.id == cloneId }
-        if (target?.copiedApkPath != null) {
-            runCatching { File(target.copiedApkPath).parentFile?.deleteRecursively() }
+        if (target != null) {
+            if (target.clonedPackageName.isNotBlank() && isPackageInstalled(target.clonedPackageName)) {
+                val uninstallIntent = Intent(
+                    Intent.ACTION_DELETE,
+                    Uri.parse("package:${target.clonedPackageName}")
+                ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                runCatching { context.startActivity(uninstallIntent) }
+            }
+            if (target.copiedApkPath != null) {
+                runCatching { File(target.copiedApkPath).parentFile?.deleteRecursively() }
+            }
         }
         persistClones(_clonedApps.value.filterNot { it.id == cloneId })
     }
@@ -269,4 +325,11 @@ class VirtualSpaceManager(private val context: Context) {
         bytes[0] = (bytes[0].toInt() and 0xfe or 0x02).toByte()
         return bytes.joinToString(":") { "%02X".format(it) }
     }
+}
+
+enum class LaunchStatus {
+    LAUNCHED,
+    INSTALLING,
+    NEEDS_INSTALL_PERMISSION,
+    APK_MISSING
 }

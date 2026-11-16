@@ -1,18 +1,17 @@
 package com.zynnn.cloneapp.ui.screens
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.*
+import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -30,14 +29,19 @@ fun AddAppScreen(
     defaultCopyApk: Boolean,
     strings: UiStrings,
     onToggleHideSystem: (Boolean) -> Unit,
+    onSelectionCountChange: (Int) -> Unit,
     onCloneBatch: (List<InstalledAppInfo>, Boolean) -> Unit,
     onShowToast: (String) -> Unit
 ) {
     val glass = LocalLiquidGlass.current
     var search by remember { mutableStateOf("") }
-    var tabIndex by remember { mutableStateOf(0) } // 0=All, 1=Hot Apps, 2=Hot Games
+    var tabIndex by remember { mutableStateOf(0) }
     var copyApk by remember { mutableStateOf(defaultCopyApk) }
     val selected = remember { mutableStateListOf<InstalledAppInfo>() }
+
+    LaunchedEffect(selected.size) {
+        onSelectionCountChange(selected.size)
+    }
 
     val filtered = remember(installedApps, hideSystemApps, search, tabIndex) {
         installedApps.filter { app ->
@@ -63,7 +67,6 @@ fun AddAppScreen(
             Text(strings.deviceApps, color = glass.textPrimary, style = MaterialTheme.typography.headlineMedium)
             Spacer(Modifier.height(10.dp))
 
-            // Search
             LiquidGlassCard(shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
                 Row(
                     modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
@@ -87,7 +90,6 @@ fun AddAppScreen(
 
             Spacer(Modifier.height(10.dp))
 
-            // Tabs: All, Hot Apps, Hot Games
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 listOf(strings.allApps, strings.hotApps, strings.hotGames).forEachIndexed { idx, label ->
                     val active = tabIndex == idx
@@ -117,7 +119,6 @@ fun AddAppScreen(
 
             Spacer(Modifier.height(10.dp))
 
-            // Copy APK & Hide System Toggles
             LiquidGlassCard(shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Row(
@@ -150,7 +151,7 @@ fun AddAppScreen(
 
             LazyColumn(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
-                contentPadding = PaddingValues(bottom = 160.dp),
+                contentPadding = PaddingValues(bottom = 140.dp),
                 modifier = Modifier.weight(1f)
             ) {
                 items(filtered, key = { it.packageName }) { app ->
@@ -204,13 +205,14 @@ fun AddAppScreen(
                     selected.clear()
                     onCloneBatch(toClone, copyApk)
                 },
-                shape = RoundedCornerShape(20.dp),
+                shape = RoundedCornerShape(22.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = glass.accentCyan),
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
-                    .padding(bottom = 96.dp)
+                    .navigationBarsPadding()
+                    .padding(bottom = 16.dp)
                     .fillMaxWidth()
-                    .height(52.dp)
+                    .height(54.dp)
             ) {
                 Icon(Icons.Rounded.Add, null, tint = Color.White)
                 Spacer(Modifier.width(8.dp))

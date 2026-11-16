@@ -11,6 +11,9 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -30,8 +33,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
+import com.zynnn.cloneapp.data.ApkClonerEngine
+import com.zynnn.cloneapp.data.LaunchStatus
 import com.zynnn.cloneapp.data.VirtualSpaceManager
 import com.zynnn.cloneapp.data.getStrings
+import com.zynnn.cloneapp.model.ClonedApp
 import com.zynnn.cloneapp.ui.components.AuroraGlassBackdrop
 import com.zynnn.cloneapp.ui.components.LiquidGlassCard
 import com.zynnn.cloneapp.ui.screens.AddAppScreen
@@ -48,7 +54,6 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         val manager = VirtualSpaceManager(applicationContext)
 
-        // Handle pinned shortcut launch
         intent?.getStringExtra("launch_clone_id")?.let { cloneId ->
             manager.clonedApps.value.find { it.id == cloneId }?.let { manager.launchClonedApp(it) }
         }
@@ -61,7 +66,8 @@ class MainActivity : ComponentActivity() {
             val scope = rememberCoroutineScope()
             val ctx = LocalContext.current
 
-            var currentTab by remember { mutableStateOf(0) } // 0=Spaces, 1=Secret, 2=Add, 3=Settings
+            var currentTab by remember { mutableStateOf(0) }
+            var addSelectionCount by remember { mutableStateOf(0) }
             var searchQuery by remember { mutableStateOf("") }
             var isCloning by remember { mutableStateOf(false) }
             var qrResultText by remember { mutableStateOf<String?>(null) }
@@ -86,7 +92,16 @@ class MainActivity : ComponentActivity() {
             }
 
             val toast: (String) -> Unit = { msg ->
-                Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show()
+                Toast.makeText(ctx, msg, Toast.LENGTH_LONG).show()
+            }
+
+            val handleLaunchClone: (ClonedApp) -> Unit = { clone ->
+                when (manager.launchClonedApp(clone)) {
+                    LaunchStatus.LAUNCHED -> {}
+                    LaunchStatus.INSTALLING -> toast("Menginstal APK clone terisolasi…")
+                    LaunchStatus.NEEDS_INSTALL_PERMISSION -> toast("Izinkan 'Install unknown apps' untuk Clone app By Zynnn, lalu buka ulang.")
+                    LaunchStatus.APK_MISSING -> toast("File APK clone tidak ditemukan, silakan clone ulang.")
+                }
             }
 
             CloneAppByZynnnTheme(
@@ -102,7 +117,7 @@ class MainActivity : ComponentActivity() {
                                 strings = strings,
                                 searchQuery = searchQuery,
                                 onSearchChange = { searchQuery = it },
-                                onLaunch = { clone -> manager.launchClonedApp(clone) },
+                                onLaunch = handleLaunchClone,
                                 onForceStop = { clone ->
                                     manager.forceStopClone(clone.id)
                                     toast(strings.forceStopped)
@@ -133,7 +148,7 @@ class MainActivity : ComponentActivity() {
                                 savedPattern = settings.gesturePattern,
                                 strings = strings,
                                 onSavePattern = { pat -> manager.updateSettings { it.copy(gesturePattern = pat) } },
-                                onLaunch = { clone -> manager.launchClonedApp(clone) },
+                                onLaunch = handleLaunchClone,
                                 onRemoveFromSecret = { clone -> manager.toggleSecretZone(clone.id) },
                                 onShowToast = toast
                             )
@@ -144,13 +159,23 @@ class MainActivity : ComponentActivity() {
                                 defaultCopyApk = settings.defaultCopyApk,
                                 strings = strings,
                                 onToggleHideSystem = { hide -> manager.updateSettings { it.copy(hideSystemApps = hide) } },
+                                onSelectionCountChange = { addSelectionCount = it },
                                 onCloneBatch = { apps, copyApk ->
                                     scope.launch {
                                         isCloning = true
-                                        val added = manager.cloneAppsBatch(apps, copyApk)
+                                        val res = manager.cloneAppsBatch(apps, copyApk)
                                         isCloning = false
-                                        added.firstOrNull()?.let { toast(strings.clonedToSpace(it.spaceId)) }
-                                        currentTab = 0
+                                        res.onSuccess { added ->
+                                            if (!ApkClonerEngine.canRequestPackageInstalls(ctx)) {
+                                                toast("Clone dibuat! Izinkan instalasi aplikasi untuk memasang ruang terpisah.")
+                                                ApkClonerEngine.openInstallPermissionSettings(ctx)
+                                            } else {
+                                                added.firstOrNull()?.let { toast(strings.clonedToSpace(it.spaceId)) }
+                                            }
+                                            currentTab = 0
+                                        }.onFailure { err ->
+                                            toast("Clone gagal: ${err.localizedMessage ?: "APK split/terproteksi"}")
+                                        }
                                     }
                                 },
                                 onShowToast = toast
@@ -165,21 +190,31 @@ class MainActivity : ComponentActivity() {
                             )
                         }
 
-                        // Floating Liquid Glass Pill Bottom Nav
-                        LiquidGlassBottomNav(
-                            currentTab = currentTab,
-                            onTabSelected = { currentTab = it },
-                            items = listOf(
-                                NavItem(strings.navSpaces, Icons.Rounded.GridView),
-                                NavItem(strings.navSecretZone, Icons.Rounded.Lock),
-                                NavItem(strings.navAddApp, Icons.Rounded.AddCircle),
-                                NavItem(strings.navSettings, Icons.Rounded.Tune)
-                            ),
-                            modifier = Modifier
-                                .align(Alignment.BottomCenter)
-                                .navigationBarsPadding()
-                                .padding(horizontal = 20.dp, vertical = 14.dp)
-                        )
+                        // Hide bottom nav while selecting apps on Add tab so Clone button is never blocked
+                        val showBottomNav = !(currentTab == 2 && addSelectionCount > 0)
+                        AnimatedVisibility(
+                            visible = showBottomNav,
+                            enter = slideInVertically(initialOffsetY = { it }),
+                            exit = slideOutVertically(targetOffsetY = { it }),
+                            modifier = Modifier.align(Alignment.BottomCenter)
+                        ) {
+                            LiquidGlassBottomNav(
+                                currentTab = currentTab,
+                                onTabSelected = {
+                                    currentTab = it
+                                    if (it != 2) addSelectionCount = 0
+                                },
+                                items = listOf(
+                                    NavItem(strings.navSpaces, Icons.Rounded.GridView),
+                                    NavItem(strings.navSecretZone, Icons.Rounded.Lock),
+                                    NavItem(strings.navAddApp, Icons.Rounded.AddCircle),
+                                    NavItem(strings.navSettings, Icons.Rounded.Tune)
+                                ),
+                                modifier = Modifier
+                                    .navigationBarsPadding()
+                                    .padding(horizontal = 20.dp, vertical = 14.dp)
+                            )
+                        }
                     }
 
                     if (isCloning) {
@@ -190,7 +225,7 @@ class MainActivity : ComponentActivity() {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     CircularProgressIndicator(modifier = Modifier.size(28.dp))
                                     Spacer(Modifier.width(16.dp))
-                                    Text("Copying app data…")
+                                    Text("Membangun APK clone terisolasi…")
                                 }
                             },
                             confirmButton = {}
