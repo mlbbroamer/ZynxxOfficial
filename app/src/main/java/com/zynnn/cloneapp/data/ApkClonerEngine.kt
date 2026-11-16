@@ -60,51 +60,21 @@ object ApkClonerEngine {
     }
 
     /**
-     * Clones the source APK by rewriting its binary AndroidManifest.xml package name &
-     * provider authorities to [newPackageName], then signing with v1+v2 ApkSigner so
-     * Android installs it with a 100% separate /data/data/<newPackageName> sandbox.
+     * Clones base.apk + all split APKs (if any) into [outputDir]:
+     * - Preserves original Java/Kotlin component class names (expands relative ".Foo" -> "oldPkg.Foo")
+     * - Rewrites only manifest package, provider authorities, and custom permissions to [newPackageName]
+     * - Signs every APK with v1+v2 ApkSigner
      */
-    fun createClonedApk(
+    fun createClonedApks(
         context: Context,
         sourceApkPath: String,
+        splitApkPaths: List<String>,
         originalPackage: String,
         newPackageName: String,
-        outputApk: File
-    ): File {
-        outputApk.parentFile?.mkdirs()
-        val unsignedApk = File(outputApk.parentFile, "unsigned_${outputApk.name}")
-
-        ZipFile(sourceApkPath).use { zipIn ->
-            ZipOutputStream(FileOutputStream(unsignedApk)).use { zipOut ->
-                val entries = zipIn.entries()
-                while (entries.hasMoreElements()) {
-                    val entry = entries.nextElement()
-                    val name = entry.name
-                    if (name.startsWith("META-INF/") &&
-                        (name.endsWith(".SF") || name.endsWith(".RSA") || name.endsWith(".DSA") || name == "META-INF/MANIFEST.MF")
-                    ) {
-                        continue
-                    }
-                    val rawBytes = zipIn.getInputStream(entry).readBytes()
-                    val outBytes = if (name == "AndroidManifest.xml") {
-                        patchAxmlPackageStrings(rawBytes, originalPackage, newPackageName)
-                    } else {
-                        rawBytes
-                    }
-                    val newEntry = ZipEntry(name)
-                    if (entry.method == ZipEntry.STORED && name != "AndroidManifest.xml") {
-                        newEntry.method = ZipEntry.STORED
-                        newEntry.size = outBytes.size.toLong()
-                        newEntry.compressedSize = outBytes.size.toLong()
-                        newEntry.crc = entry.crc
-                    }
-                    zipOut.putNextEntry(newEntry)
-                    zipOut.write(outBytes)
-                    zipOut.closeEntry()
-                }
-            }
-        }
-
+        outputDir: File
+    ): List<File> {
+        outputDir.mkdirs()
+        val allSources = listOf(sourceApkPath) + splitApkPaths
         val (privateKey, cert) = getOrCreateSigningKey(context)
         val signerConfig = ApkSigner.SignerConfig.Builder(
             "ZynnnCloneKey",
@@ -112,27 +82,69 @@ object ApkClonerEngine {
             listOf(cert)
         ).build()
 
-        ApkSigner.Builder(listOf(signerConfig))
-            .setInputApk(unsignedApk)
-            .setOutputApk(outputApk)
-            .setV1SigningEnabled(true)
-            .setV2SigningEnabled(true)
-            .setV3SigningEnabled(false)
-            .build()
-            .sign()
+        return allSources.mapIndexed { idx, srcPath ->
+            val name = if (idx == 0) "base.apk" else "split_$idx.apk"
+            val unsignedApk = File(outputDir, "unsigned_$name")
+            val signedApk = File(outputDir, name)
 
-        unsignedApk.delete()
-        return outputApk
+            ZipFile(srcPath).use { zipIn ->
+                ZipOutputStream(FileOutputStream(unsignedApk)).use { zipOut ->
+                    val entries = zipIn.entries()
+                    while (entries.hasMoreElements()) {
+                        val entry = entries.nextElement()
+                        val entryName = entry.name
+                        if (entryName.startsWith("META-INF/") &&
+                            (entryName.endsWith(".SF") || entryName.endsWith(".RSA") ||
+                                entryName.endsWith(".DSA") || entryName == "META-INF/MANIFEST.MF")
+                        ) {
+                            continue
+                        }
+                        val rawBytes = zipIn.getInputStream(entry).readBytes()
+                        val outBytes = if (entryName == "AndroidManifest.xml") {
+                            patchManifestAxml(rawBytes, originalPackage, newPackageName)
+                        } else {
+                            rawBytes
+                        }
+                        val newEntry = ZipEntry(entryName)
+                        if (entry.method == ZipEntry.STORED && entryName != "AndroidManifest.xml") {
+                            newEntry.method = ZipEntry.STORED
+                            newEntry.size = outBytes.size.toLong()
+                            newEntry.compressedSize = outBytes.size.toLong()
+                            newEntry.crc = entry.crc
+                        }
+                        zipOut.putNextEntry(newEntry)
+                        zipOut.write(outBytes)
+                        zipOut.closeEntry()
+                    }
+                }
+            }
+
+            ApkSigner.Builder(listOf(signerConfig))
+                .setInputApk(unsignedApk)
+                .setOutputApk(signedApk)
+                .setV1SigningEnabled(true)
+                .setV2SigningEnabled(true)
+                .setV3SigningEnabled(false)
+                .build()
+                .sign()
+
+            unsignedApk.delete()
+            signedApk
+        }
     }
 
-    fun installClonedApk(context: Context, apkFile: File) {
+    fun installClonedApks(context: Context, apkFiles: List<File>) {
+        if (apkFiles.isEmpty()) return
         val installer = context.packageManager.packageInstaller
         val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
         val sessionId = installer.createSession(params)
         installer.openSession(sessionId).use { session ->
-            session.openWrite("base.apk", 0, apkFile.length()).use { out ->
-                apkFile.inputStream().use { it.copyTo(out) }
-                session.fsync(out)
+            apkFiles.forEachIndexed { idx, apkFile ->
+                val writeName = if (idx == 0) "base.apk" else "split_$idx.apk"
+                session.openWrite(writeName, 0, apkFile.length()).use { out ->
+                    apkFile.inputStream().use { it.copyTo(out) }
+                    session.fsync(out)
+                }
             }
             val intent = Intent(context, InstallResultReceiver::class.java)
             val pi = PendingIntent.getBroadcast(
@@ -146,19 +158,23 @@ object ApkClonerEngine {
     }
 
     /**
-     * Rebuilds the AXML StringPool chunk replacing [oldPkg] prefix with [newPkg]
-     * (handles package name, provider authorities, and custom permissions) while keeping
-     * exact 4-byte chunk alignment and updating ResChunk_header sizes.
+     * Attribute-aware binary AXML patcher:
+     * 1. Walks XML_START_ELEMENT chunks to find exact string indices used for:
+     *    - <manifest package="..."> -> [newPkg]
+     *    - <provider android:authorities="..."> -> replaces [oldPkg] with [newPkg]
+     *    - <application/activity/service/receiver/provider android:name=".Foo"> -> expands to "[oldPkg].Foo"
+     *      so Android does NOT throw ClassNotFoundException when package is changed!
+     * 2. Appends modified strings to the StringPool and updates attribute rawValue + typedValue.data
+     *    without corrupting any Java class names!
      */
-    private fun patchAxmlPackageStrings(axml: ByteArray, oldPkg: String, newPkg: String): ByteArray {
+    private fun patchManifestAxml(axml: ByteArray, oldPkg: String, newPkg: String): ByteArray {
         if (axml.size < 16) return axml
-        val buf = ByteBuffer.wrap(axml).order(ByteOrder.LITTLE_ENDIAN)
-        val fileType = buf.getShort(0).toInt() and 0xFFFF
-        if (fileType != 0x0003) return axml // Not AXML
+        val work = axml.copyOf()
+        val buf = ByteBuffer.wrap(work).order(ByteOrder.LITTLE_ENDIAN)
+        if ((buf.getShort(0).toInt() and 0xFFFF) != 0x0003) return axml
 
         val spOffset = 8
-        val spType = buf.getShort(spOffset).toInt() and 0xFFFF
-        if (spType != 0x0001) return axml
+        if ((buf.getShort(spOffset).toInt() and 0xFFFF) != 0x0001) return axml
         val spOldSize = buf.getInt(spOffset + 4)
         val stringCount = buf.getInt(spOffset + 8)
         val styleCount = buf.getInt(spOffset + 12)
@@ -169,24 +185,24 @@ object ApkClonerEngine {
 
         val offsetsBase = spOffset + 28
         val dataBase = spOffset + stringsStart
-        val decoded = ArrayList<String>(stringCount)
+        val strings = ArrayList<String>(stringCount)
 
         for (i in 0 until stringCount) {
             val strOff = buf.getInt(offsetsBase + i * 4)
             var p = dataBase + strOff
             val str = if (isUtf8) {
-                val b1 = axml[p].toInt() and 0xFF
+                val b1 = work[p].toInt() and 0xFF
                 p += if ((b1 and 0x80) != 0) 2 else 1
-                val b2 = axml[p].toInt() and 0xFF
+                val b2 = work[p].toInt() and 0xFF
                 val byteLen = if ((b2 and 0x80) != 0) {
-                    val v = ((b2 and 0x7F) shl 8) or (axml[p + 1].toInt() and 0xFF)
+                    val v = ((b2 and 0x7F) shl 8) or (work[p + 1].toInt() and 0xFF)
                     p += 2
                     v
                 } else {
                     p += 1
                     b2
                 }
-                String(axml, p, byteLen, Charsets.UTF_8)
+                String(work, p, byteLen, Charsets.UTF_8)
             } else {
                 var cLen = buf.getShort(p).toInt() and 0xFFFF
                 p += 2
@@ -194,22 +210,86 @@ object ApkClonerEngine {
                     cLen = ((cLen and 0x7FFF) shl 16) or (buf.getShort(p).toInt() and 0xFFFF)
                     p += 2
                 }
-                String(axml, p, cLen * 2, Charsets.UTF_16LE)
+                String(work, p, cLen * 2, Charsets.UTF_16LE)
             }
-            val patched = if (str == oldPkg || str.startsWith("$oldPkg.")) {
-                newPkg + str.removePrefix(oldPkg)
-            } else {
-                str
-            }
-            decoded.add(patched)
+            strings.add(str)
         }
 
-        // Rebuild StringPool bytes
+        val componentTags = setOf("application", "activity", "activity-alias", "service", "receiver", "provider")
+
+        fun getOrAddString(value: String): Int {
+            val existing = strings.indexOf(value)
+            if (existing >= 0) return existing
+            strings.add(value)
+            return strings.size - 1
+        }
+
+        // Walk chunks after StringPool (ResourceMap + XML tree)
+        var pos = spOffset + spOldSize
+        while (pos + 8 <= work.size) {
+            val chunkType = buf.getShort(pos).toInt() and 0xFFFF
+            val chunkSize = buf.getInt(pos + 4)
+            if (chunkSize <= 0 || pos + chunkSize > work.size) break
+
+            if (chunkType == 0x0102) { // RES_XML_START_ELEMENT_TYPE
+                val nameIdx = buf.getInt(pos + 20)
+                val tagName = strings.getOrNull(nameIdx) ?: ""
+                val attrStart = buf.getShort(pos + 24).toInt() and 0xFFFF
+                val attrSize = buf.getShort(pos + 26).toInt() and 0xFFFF
+                val attrCount = buf.getShort(pos + 28).toInt() and 0xFFFF
+                val attrsBase = pos + 16 + attrStart // ResXMLTree_node(16) + attrStart
+
+                for (a in 0 until attrCount) {
+                    val aOff = attrsBase + a * attrSize
+                    if (aOff + 20 > work.size) break
+                    val attrNameIdx = buf.getInt(aOff + 4)
+                    val attrName = strings.getOrNull(attrNameIdx) ?: ""
+                    val rawValIdx = buf.getInt(aOff + 8)
+                    val valType = work[aOff + 15].toInt() and 0xFF
+                    if (valType == 0x03 && rawValIdx in strings.indices) { // TYPE_STRING
+                        val curVal = strings[rawValIdx]
+                        var newVal: String? = null
+                        when {
+                            tagName == "manifest" && attrName == "package" -> {
+                                newVal = newPkg
+                            }
+                            tagName == "provider" && attrName == "authorities" -> {
+                                newVal = curVal.split(";").joinToString(";") { auth ->
+                                    if (auth.contains(oldPkg)) auth.replace(oldPkg, newPkg) else "$newPkg.$auth"
+                                }
+                            }
+                            tagName in componentTags && attrName == "name" -> {
+                                // Expand relative ".MainActivity" to "oldPkg.MainActivity" so class resolution succeeds!
+                                if (curVal.startsWith(".")) {
+                                    newVal = oldPkg + curVal
+                                } else if (!curVal.contains(".")) {
+                                    newVal = "$oldPkg.$curVal"
+                                }
+                            }
+                            (tagName == "permission" || tagName == "uses-permission") && attrName == "name" -> {
+                                if (curVal.startsWith("$oldPkg.")) {
+                                    newVal = newPkg + curVal.removePrefix(oldPkg)
+                                }
+                            }
+                        }
+                        if (newVal != null && newVal != curVal) {
+                            val newIdx = getOrAddString(newVal)
+                            buf.putInt(aOff + 8, newIdx)  // rawValue
+                            buf.putInt(aOff + 16, newIdx) // typedValue.data
+                        }
+                    }
+                }
+            }
+            pos += chunkSize
+        }
+
+        // Rebuild StringPool with updated strings
+        val newStringCount = strings.size
         val poolData = ByteArrayOutputStream()
-        val newOffsets = IntArray(stringCount)
-        for (i in 0 until stringCount) {
+        val newOffsets = IntArray(newStringCount)
+        for (i in 0 until newStringCount) {
             newOffsets[i] = poolData.size()
-            val s = decoded[i]
+            val s = strings[i]
             if (isUtf8) {
                 val bytes = s.toByteArray(Charsets.UTF_8)
                 writeLen8(poolData, s.length)
@@ -227,39 +307,35 @@ object ApkClonerEngine {
         while (poolData.size() % 4 != 0) poolData.write(0)
 
         val stylesSize = if (stylesStart > 0) spOldSize - stylesStart else 0
-        val headerSize = 28 + (stringCount + styleCount) * 4
+        val headerSize = 28 + (newStringCount + styleCount) * 4
         val newStringsStart = headerSize
         val newStylesStart = if (stylesStart > 0) newStringsStart + poolData.size() else 0
         val newSpSize = headerSize + poolData.size() + stylesSize
 
         val out = ByteArrayOutputStream()
         val hdr = ByteBuffer.allocate(8 + headerSize).order(ByteOrder.LITTLE_ENDIAN)
-        // File header (placeholder total size)
         hdr.putShort(0x0003.toShort())
         hdr.putShort(8.toShort())
         hdr.putInt(0)
-        // StringPool header
         hdr.putShort(0x0001.toShort())
         hdr.putShort(28.toShort())
         hdr.putInt(newSpSize)
-        hdr.putInt(stringCount)
+        hdr.putInt(newStringCount)
         hdr.putInt(styleCount)
         hdr.putInt(flags)
         hdr.putInt(newStringsStart)
         hdr.putInt(newStylesStart)
         for (o in newOffsets) hdr.putInt(o)
-        // Copy style offsets if any
         for (i in 0 until styleCount) {
             hdr.putInt(buf.getInt(offsetsBase + stringCount * 4 + i * 4))
         }
         out.write(hdr.array())
         out.write(poolData.toByteArray())
         if (stylesSize > 0) {
-            out.write(axml, spOffset + stylesStart, stylesSize)
+            out.write(work, spOffset + stylesStart, stylesSize)
         }
-        // Append remaining AXML chunks after StringPool
         val restStart = spOffset + spOldSize
-        out.write(axml, restStart, axml.size - restStart)
+        out.write(work, restStart, work.size - restStart)
 
         val result = out.toByteArray()
         ByteBuffer.wrap(result).order(ByteOrder.LITTLE_ENDIAN).putInt(4, result.size)
@@ -296,7 +372,6 @@ object ApkClonerEngine {
             val cert = ks.getCertificate(alias) as X509Certificate
             return key to cert
         }
-        // Generate self-signed RSA 2048 key using AndroidKeyStore or BouncyCastle-free fallback
         val kpg = KeyPairGenerator.getInstance("RSA")
         kpg.initialize(2048)
         val kp = kpg.generateKeyPair()

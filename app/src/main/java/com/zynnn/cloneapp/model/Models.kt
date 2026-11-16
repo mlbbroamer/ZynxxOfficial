@@ -34,6 +34,7 @@ data class InstalledAppInfo(
     val isHotApp: Boolean = false,
     val isHotGame: Boolean = false,
     val apkPath: String = "",
+    val splitApkPaths: List<String> = emptyList(),
     val sizeMb: Float = 0f
 )
 
