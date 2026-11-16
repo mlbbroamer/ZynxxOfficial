@@ -1,0 +1,3 @@
+-keep class com.zynnn.cloneapp.model.** { *; }
+-keepattributes Signature
+-keepattributes *Annotation*
